@@ -3,6 +3,7 @@
 # Copyright (c) Megvii, Inc. and its affiliates.
 
 import argparse
+import os
 import random
 import warnings
 from loguru import logger
@@ -15,10 +16,28 @@ from yolox.exp import Exp, check_exp_value, get_exp
 from yolox.utils import configure_module, configure_nccl, configure_omp, get_num_devices
 
 
+def _auto_device() -> str:
+    """Return best available device string: gpu (CUDA) -> mps -> cpu"""
+    if torch.cuda.is_available():
+        return "gpu"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def make_parser():
     parser = argparse.ArgumentParser("YOLOX train parser")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
+
+    # NEW: device selection
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "gpu", "cpu", "mps"],
+        help="Training device: auto|gpu(CUDA)|mps(Apple)|cpu",
+    )
 
     # distributed
     parser.add_argument(
@@ -32,7 +51,7 @@ def make_parser():
     )
     parser.add_argument("-b", "--batch-size", type=int, default=64, help="batch size")
     parser.add_argument(
-        "-d", "--devices", default=None, type=int, help="device for training"
+        "-d", "--devices", default=None, type=int, help="number of devices for training (CUDA only)"
     )
     parser.add_argument(
         "-f",
@@ -63,7 +82,7 @@ def make_parser():
         dest="fp16",
         default=False,
         action="store_true",
-        help="Adopting mix precision training.",
+        help="Adopting mix precision training (CUDA only).",
     )
     parser.add_argument(
         "--cache",
@@ -84,8 +103,7 @@ def make_parser():
         "-l",
         "--logger",
         type=str,
-        help="Logger to be used for metrics. \
-                Implemented loggers include `tensorboard`, `mlflow` and `wandb`.",
+        help="Logger to be used for metrics. Implemented: tensorboard, mlflow, wandb",
         default="tensorboard"
     )
     parser.add_argument(
@@ -109,9 +127,11 @@ def main(exp: Exp, args):
             "when restarting from checkpoints."
         )
 
-    # set environment variables for distributed training
+    # Configure distributed env vars (safe to call even if not using NCCL)
     configure_nccl()
     configure_omp()
+
+    # Only makes sense for CUDA
     cudnn.benchmark = True
 
     trainer = exp.get_trainer(args)
@@ -121,6 +141,26 @@ def main(exp: Exp, args):
 if __name__ == "__main__":
     configure_module()
     args = make_parser().parse_args()
+
+    # Resolve device choice
+    device = args.device.lower()
+    if device == "auto":
+        device = _auto_device()
+
+    # If user asked for GPU but CUDA isn't available, fall back cleanly
+    if device == "gpu" and not torch.cuda.is_available():
+        logger.warning("CUDA not available; falling back to CPU.")
+        device = "cpu"
+
+    # If user asked for MPS but it's not available, fall back cleanly
+    if device == "mps":
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            logger.warning("MPS not available; falling back to CPU.")
+            device = "cpu"
+
+    # Store resolved device back into args so exp/trainer can read it
+    args.device = device
+
     exp = get_exp(args.exp_file, args.name)
     exp.merge(args.opts)
     check_exp_value(exp)
@@ -128,19 +168,38 @@ if __name__ == "__main__":
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
 
-    num_gpu = get_num_devices() if args.devices is None else args.devices
-    assert num_gpu <= get_num_devices()
-
     if args.cache is not None:
         exp.dataset = exp.get_dataset(cache=True, cache_type=args.cache)
 
-    dist_url = "auto" if args.dist_url is None else args.dist_url
-    launch(
-        main,
-        num_gpu,
-        args.num_machines,
-        args.machine_rank,
-        backend=args.dist_backend,
-        dist_url=dist_url,
-        args=(exp, args),
-    )
+    # ---- CUDA path: keep original distributed launch behavior ----
+    if args.device == "gpu":
+        num_gpu = get_num_devices() if args.devices is None else args.devices
+        assert num_gpu <= get_num_devices()
+
+        dist_url = "auto" if args.dist_url is None else args.dist_url
+        launch(
+            main,
+            num_gpu,
+            args.num_machines,
+            args.machine_rank,
+            backend=args.dist_backend,
+            dist_url=dist_url,
+            args=(exp, args),
+        )
+
+    # ---- Non-CUDA path: run single-process (no torch.cuda assumptions) ----
+    else:
+        # Disable CUDA visibility just in case someone has a weird setup
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+        # fp16 in this repo is CUDA-focused; disable for cpu/mps
+        if args.fp16:
+            logger.warning("FP16 flag is CUDA-only in this training setup; disabling fp16.")
+            args.fp16 = False
+
+        # Use gloo if anything in trainer tries to init distributed
+        if args.dist_backend == "nccl":
+            args.dist_backend = "gloo"
+
+        logger.info(f"Running single-process training on device='{args.device}' (no distributed launch).")
+        main(exp, args)

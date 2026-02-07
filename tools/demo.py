@@ -8,7 +8,6 @@ import time
 from loguru import logger
 
 import cv2
-
 import torch
 
 from yolox.data.data_augment import ValTransform
@@ -21,15 +20,11 @@ IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
 def make_parser():
     parser = argparse.ArgumentParser("YOLOX Demo!")
-    parser.add_argument(
-        "demo", default="image", help="demo type, eg. image, video and webcam"
-    )
+    parser.add_argument("demo", default="image", help="demo type, eg. image, video and webcam")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
 
-    parser.add_argument(
-        "--path", default="./assets/dog.jpg", help="path to images or video"
-    )
+    parser.add_argument("--path", default="./assets/dog.jpg", help="path to images or video")
     parser.add_argument("--camid", type=int, default=0, help="webcam demo camera id")
     parser.add_argument(
         "--save_result",
@@ -50,7 +45,7 @@ def make_parser():
         "--device",
         default="cpu",
         type=str,
-        help="device to run our model, can either be cpu or gpu",
+        help="device to run model: cpu | gpu (CUDA) | mps (Apple Silicon)",
     )
     parser.add_argument("--conf", default=0.3, type=float, help="test conf")
     parser.add_argument("--nms", default=0.3, type=float, help="test nms threshold")
@@ -60,7 +55,7 @@ def make_parser():
         dest="fp16",
         default=False,
         action="store_true",
-        help="Adopting mix precision evaluating.",
+        help="Adopting mix precision evaluating (CUDA only).",
     )
     parser.add_argument(
         "--legacy",
@@ -81,7 +76,7 @@ def make_parser():
         dest="trt",
         default=False,
         action="store_true",
-        help="Using TensorRT model for testing.",
+        help="Using TensorRT model for testing (CUDA only).",
     )
     return parser
 
@@ -95,6 +90,36 @@ def get_image_list(path):
             if ext in IMAGE_EXT:
                 image_names.append(apath)
     return image_names
+
+
+def _move_model(model, device: str, fp16: bool):
+    device = device.lower()
+    if device in ("gpu", "cuda"):
+        model.cuda()
+        if fp16:
+            model.half()
+        return model
+
+    if device == "mps":
+        # FP16 on MPS is not consistently beneficial; keep fp32
+        model.to("mps")
+        return model
+
+    # cpu
+    model.cpu()
+    return model
+
+
+def _move_tensor(x: torch.Tensor, device: str, fp16: bool) -> torch.Tensor:
+    device = device.lower()
+    if device in ("gpu", "cuda"):
+        x = x.cuda()
+        if fp16:
+            x = x.half()
+        return x
+    if device == "mps":
+        return x.to("mps")
+    return x
 
 
 class Predictor(object):
@@ -119,7 +144,9 @@ class Predictor(object):
         self.device = device
         self.fp16 = fp16
         self.preproc = ValTransform(legacy=legacy)
+
         if trt_file is not None:
+            # TRT is CUDA-only; keep the old behavior
             from torch2trt import TRTModule
 
             model_trt = TRTModule()
@@ -146,12 +173,9 @@ class Predictor(object):
         img_info["ratio"] = ratio
 
         img, _ = self.preproc(img, None, self.test_size)
-        img = torch.from_numpy(img).unsqueeze(0)
-        img = img.float()
-        if self.device == "gpu":
-            img = img.cuda()
-            if self.fp16:
-                img = img.half()  # to FP16
+        img = torch.from_numpy(img).unsqueeze(0).float()
+
+        img = _move_tensor(img, self.device, self.fp16)
 
         with torch.no_grad():
             t0 = time.time()
@@ -173,8 +197,6 @@ class Predictor(object):
         output = output.cpu()
 
         bboxes = output[:, 0:4]
-
-        # preprocessing: resize
         bboxes /= ratio
 
         cls = output[:, 6]
@@ -194,27 +216,26 @@ def image_demo(predictor, vis_folder, path, current_time, save_result):
         outputs, img_info = predictor.inference(image_name)
         result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if save_result:
-            save_folder = os.path.join(
-                vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            )
+            save_folder = os.path.join(vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time))
             os.makedirs(save_folder, exist_ok=True)
             save_file_name = os.path.join(save_folder, os.path.basename(image_name))
             logger.info("Saving detection result in {}".format(save_file_name))
             cv2.imwrite(save_file_name, result_image)
         ch = cv2.waitKey(0)
-        if ch == 27 or ch == ord("q") or ch == ord("Q"):
+        if ch == 27 or ch in (ord("q"), ord("Q")):
             break
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
     cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
+    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 1:
+        fps = 30
+
     if args.save_result:
-        save_folder = os.path.join(
-            vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-        )
+        save_folder = os.path.join(vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time))
         os.makedirs(save_folder, exist_ok=True)
         if args.demo == "video":
             save_path = os.path.join(save_folder, os.path.basename(args.path))
@@ -224,20 +245,23 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         vid_writer = cv2.VideoWriter(
             save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
         )
+
     while True:
         ret_val, frame = cap.read()
-        if ret_val:
-            outputs, img_info = predictor.inference(frame)
-            result_frame = predictor.visual(outputs[0], img_info, predictor.confthre)
-            if args.save_result:
-                vid_writer.write(result_frame)
-            else:
-                cv2.namedWindow("yolox", cv2.WINDOW_NORMAL)
-                cv2.imshow("yolox", result_frame)
-            ch = cv2.waitKey(1)
-            if ch == 27 or ch == ord("q") or ch == ord("Q"):
-                break
+        if not ret_val:
+            break
+
+        outputs, img_info = predictor.inference(frame)
+        result_frame = predictor.visual(outputs[0], img_info, predictor.confthre)
+
+        if args.save_result:
+            vid_writer.write(result_frame)
         else:
+            cv2.namedWindow("yolox", cv2.WINDOW_NORMAL)
+            cv2.imshow("yolox", result_frame)
+
+        ch = cv2.waitKey(1)
+        if ch == 27 or ch in (ord("q"), ord("Q")):
             break
 
 
@@ -253,6 +277,7 @@ def main(exp, args):
         vis_folder = os.path.join(file_name, "vis_res")
         os.makedirs(vis_folder, exist_ok=True)
 
+    # TRT implies CUDA
     if args.trt:
         args.device = "gpu"
 
@@ -268,20 +293,13 @@ def main(exp, args):
     model = exp.get_model()
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
 
-    if args.device == "gpu":
-        model.cuda()
-        if args.fp16:
-            model.half()  # to FP16
+    model = _move_model(model, args.device, args.fp16)
     model.eval()
 
     if not args.trt:
-        if args.ckpt is None:
-            ckpt_file = os.path.join(file_name, "best_ckpt.pth")
-        else:
-            ckpt_file = args.ckpt
+        ckpt_file = args.ckpt if args.ckpt is not None else os.path.join(file_name, "best_ckpt.pth")
         logger.info("loading checkpoint")
         ckpt = torch.load(ckpt_file, map_location="cpu")
-        # load the model state dict
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
 
@@ -290,11 +308,9 @@ def main(exp, args):
         model = fuse_model(model)
 
     if args.trt:
-        assert not args.fuse, "TensorRT model is not support model fusing!"
+        assert not args.fuse, "TensorRT model does not support model fusing!"
         trt_file = os.path.join(file_name, "model_trt.pth")
-        assert os.path.exists(
-            trt_file
-        ), "TensorRT model is not found!\n Run python3 tools/trt.py first!"
+        assert os.path.exists(trt_file), "TensorRT model is not found! Run python tools/trt.py first!"
         model.head.decode_in_inference = False
         decoder = model.head.decode_outputs
         logger.info("Using TensorRT to inference")
@@ -302,19 +318,23 @@ def main(exp, args):
         trt_file = None
         decoder = None
 
+    # ✅ Use custom class names if your Exp provides them; otherwise COCO
+    cls_names = getattr(exp, "class_names", COCO_CLASSES)
+    logger.info(f"Using class names: {cls_names}")
+
     predictor = Predictor(
-        model, exp, COCO_CLASSES, trt_file, decoder,
+        model, exp, cls_names, trt_file, decoder,
         args.device, args.fp16, args.legacy,
     )
+
     current_time = time.localtime()
     if args.demo == "image":
         image_demo(predictor, vis_folder, args.path, current_time, args.save_result)
-    elif args.demo == "video" or args.demo == "webcam":
+    elif args.demo in ("video", "webcam"):
         imageflow_demo(predictor, vis_folder, current_time, args)
 
 
 if __name__ == "__main__":
     args = make_parser().parse_args()
     exp = get_exp(args.exp_file, args.name)
-
     main(exp, args)
