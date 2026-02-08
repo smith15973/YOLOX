@@ -1,4 +1,28 @@
 #!/usr/bin/env python3
+
+# ------------------------------------------------------------
+# YOLOX Training Launcher
+#
+# Windows users: Some Python packages and YOLOX dependencies
+# require the Visual Studio C++ build tools. If you encounter
+# build or install errors, run this script from the
+# "Developer Command Prompt for Visual Studio (x64)" or launch:
+#
+#   & cmd /k '"C:\Program Files (x86)\Microsoft Visual Studio\18\
+#   BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64'
+#
+# This sets up the MSVC compiler environment needed for native
+# extensions. Once dependencies are installed, normal terminals
+# usually work fine for training.
+#
+# Example:
+# python .\scripts\train.py --exp exps/example/custom/yolox_nano_basketball.py --base-name yolox_nano_basketball --device gpu --batch 24 --ckpt pretrained/yolox_nano.pth
+#
+# Resume Example:
+# python .\scripts\train.py --exp exps/example/custom/yolox_nano_basketball.py --name yolox_nano_basketball --device gpu --batch 24 --resume --ckpt YOLOX_outputs\yolox_nano_basketball\latest_ckpt.pth
+# ------------------------------------------------------------
+
+
 from __future__ import annotations
 
 import argparse
@@ -22,13 +46,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--exp",
-        default="exps/example/custom/yolox_s_basketball.py",
+        default="exps/example/custom/yolox_nano_basketball.py",
         help="Exp file path (relative to YOLOX root).",
     )
 
     parser.add_argument(
         "--base-name",
-        default="yolox_s_basketball",
+        default="yolox_nano_basketball",
         help="Prefix for output folder under YOLOX_outputs/ (timestamp will be appended by default).",
     )
 
@@ -61,11 +85,11 @@ def main() -> int:
         help="Number of CUDA devices for training (CUDA only; default: 1).",
     )
 
-    # Default checkpoint like your old command: -c pretrained/yolox_s.pth
+    # Default checkpoint like your old command: -c pretrained/yolox_nano.pth
     parser.add_argument(
         "--ckpt",
-        default="pretrained/yolox_s.pth",
-        help="Checkpoint path (.pth). Default: pretrained/yolox_s.pth",
+        default="pretrained/yolox_nano.pth",
+        help="Checkpoint path (.pth). Default: pretrained/yolox_nano.pth",
     )
 
     # FP16: enabled by default for CUDA, off otherwise.
