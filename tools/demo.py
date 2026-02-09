@@ -2,6 +2,32 @@
 # -*- coding:utf-8 -*-
 # Copyright (c) Megvii, Inc. and its affiliates.
 
+"""
+============================== YOLOX DEMO USAGE ==============================
+
+WEBCAM (CPU)
+python -m tools.demo webcam -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --camid 0 --conf 0.3 --nms 0.3 --tsize 640 --device cpu
+
+WEBCAM (NVIDIA CUDA GPU)
+python -m tools.demo webcam -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --camid 0 --conf 0.3 --nms 0.3 --tsize 640 --device gpu --fp16
+
+IMAGE
+python -m tools.demo image -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --path assets/dog.jpg --conf 0.3 --nms 0.3 --tsize 640 --save_result
+
+IMAGE FOLDER
+python -m tools.demo image -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --path ./my_images --conf 0.3 --nms 0.3 --tsize 640 --save_result
+
+VIDEO FILE
+python -m tools.demo video -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --path ./video.mp4 --conf 0.3 --nms 0.3 --tsize 640 --save_result
+
+NOTES
+- device: cpu | gpu
+- gpu = NVIDIA CUDA
+- tsize 640 = good speed/accuracy balance
+
+===============================================================================
+"""
+
 import argparse
 import os
 import time
@@ -299,7 +325,7 @@ def main(exp, args):
     if not args.trt:
         ckpt_file = args.ckpt if args.ckpt is not None else os.path.join(file_name, "best_ckpt.pth")
         logger.info("loading checkpoint")
-        ckpt = torch.load(ckpt_file, map_location="cpu")
+        ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
 
