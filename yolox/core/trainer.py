@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) Megvii, Inc. and its affiliates.
 
+import contextlib
 import datetime
 import os
 import time
@@ -30,8 +31,34 @@ from yolox.utils import (
     occupy_mem,
     save_checkpoint,
     setup_logger,
-    synchronize
+    synchronize,
 )
+
+
+class _NoCudaPrefetcher:
+    """
+    Fallback prefetcher for CPU/MPS.
+
+    YOLOX's CUDA DataPrefetcher uses torch.cuda.Stream + .cuda(non_blocking=True).
+    That explodes on CPU/MPS. This class keeps the Trainer loop unchanged by
+    providing a `.next()` method that returns (inps, targets) already moved to the
+    chosen device.
+    """
+
+    def __init__(self, loader, device: torch.device):
+        self.loader = iter(loader)
+        self.device = device
+
+    def next(self):
+        try:
+            inps, targets, _, _ = next(self.loader)
+        except StopIteration:
+            return None, None
+
+        # Move tensors to the right device. non_blocking doesn't help on CPU/MPS.
+        inps = inps.to(self.device, non_blocking=False)
+        targets = targets.to(self.device, non_blocking=False)
+        return inps, targets
 
 
 class Trainer:
@@ -41,19 +68,38 @@ class Trainer:
         self.exp = exp
         self.args = args
 
+        # -------------------------
+        # Device selection (honor tools/train.py args.device)
+        # -------------------------
+        dev = getattr(args, "device", "gpu")
+        if dev == "gpu":
+            self.local_rank = get_local_rank()
+            self.device = torch.device(f"cuda:{self.local_rank}")
+        elif dev == "mps":
+            self.local_rank = 0
+            self.device = torch.device("mps")
+        else:
+            self.local_rank = 0
+            self.device = torch.device("cpu")
+
+        self.is_cuda = self.device.type == "cuda"
+
         # training related attr
         self.max_epoch = exp.max_epoch
-        self.amp_training = args.fp16
-        self.scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+
+        # fp16 + AMP in this repo is CUDA AMP; only enable on CUDA
+        self.amp_training = bool(args.fp16 and self.is_cuda)
+
+        # CUDA GradScaler only if CUDA + fp16
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_training) if self.is_cuda else None
+
         self.is_distributed = get_world_size() > 1
         self.rank = get_rank()
-        self.local_rank = get_local_rank()
-        self.device = "cuda:{}".format(self.local_rank)
         self.use_model_ema = exp.ema
         self.save_history_ckpt = exp.save_history_ckpt
 
         # data/dataloader related attr
-        self.data_type = torch.float16 if args.fp16 else torch.float32
+        self.data_type = torch.float16 if self.amp_training else torch.float32
         self.input_size = exp.input_size
         self.best_ap = 0
 
@@ -97,21 +143,37 @@ class Trainer:
         iter_start_time = time.time()
 
         inps, targets = self.prefetcher.next()
+        if inps is None:
+            return
+
+        # If CUDA prefetcher: tensors already on GPU
+        # If CPU/MPS prefetcher: tensors already moved to device
         inps = inps.to(self.data_type)
         targets = targets.to(self.data_type)
         targets.requires_grad = False
         inps, targets = self.exp.preprocess(inps, targets, self.input_size)
         data_end_time = time.time()
 
-        with torch.cuda.amp.autocast(enabled=self.amp_training):
+        # AMP context: CUDA only
+        amp_ctx = (
+            torch.cuda.amp.autocast(enabled=self.amp_training)
+            if self.is_cuda
+            else contextlib.nullcontext()
+        )
+        with amp_ctx:
             outputs = self.model(inps, targets)
 
         loss = outputs["total_loss"]
 
         self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+
+        if self.is_cuda and self.amp_training:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
 
         if self.use_model_ema:
             self.ema_model.update(self.model)
@@ -133,11 +195,11 @@ class Trainer:
         logger.info("exp value:\n{}".format(self.exp))
 
         # model related init
-        torch.cuda.set_device(self.local_rank)
+        if self.is_cuda:
+            torch.cuda.set_device(self.local_rank)
+
         model = self.exp.get_model()
-        logger.info(
-            "Model Summary: {}".format(get_model_info(model, self.exp.test_size))
-        )
+        logger.info("Model Summary: {}".format(get_model_info(model, self.exp.test_size)))
         model.to(self.device)
 
         # solver related init
@@ -155,17 +217,25 @@ class Trainer:
             cache_img=self.args.cache,
         )
         logger.info("init prefetcher, this might take one minute or less...")
-        self.prefetcher = DataPrefetcher(self.train_loader)
+
+        # Prefetcher: CUDA fast path vs CPU/MPS safe path
+        if self.is_cuda:
+            self.prefetcher = DataPrefetcher(self.train_loader)
+        else:
+            self.prefetcher = _NoCudaPrefetcher(self.train_loader, self.device)
+
         # max_iter means iters per epoch
         self.max_iter = len(self.train_loader)
 
         self.lr_scheduler = self.exp.get_lr_scheduler(
             self.exp.basic_lr_per_img * self.args.batch_size, self.max_iter
         )
-        if self.args.occupy:
+
+        if self.args.occupy and self.is_cuda:
             occupy_mem(self.local_rank)
 
-        if self.is_distributed:
+        # DDP only when CUDA distributed is actually used (your tools/train.py only launches on CUDA)
+        if self.is_distributed and self.is_cuda:
             model = DDP(model, device_ids=[self.local_rank], broadcast_buffers=False)
 
         if self.use_model_ema:
@@ -177,6 +247,7 @@ class Trainer:
         self.evaluator = self.exp.get_evaluator(
             batch_size=self.args.batch_size, is_distributed=self.is_distributed
         )
+
         # Tensorboard and Wandb loggers
         if self.rank == 0:
             if self.args.logger == "tensorboard":
@@ -185,7 +256,7 @@ class Trainer:
                 self.wandb_logger = WandbLogger.initialize_wandb_logger(
                     self.args,
                     self.exp,
-                    self.evaluator.dataloader.dataset
+                    self.evaluator.dataloader.dataset,
                 )
             elif self.args.logger == "mlflow":
                 self.mlflow_logger = MlflowLogger()
@@ -207,12 +278,13 @@ class Trainer:
                 metadata = {
                     "epoch": self.epoch + 1,
                     "input_size": self.input_size,
-                    'start_ckpt': self.args.ckpt,
-                    'exp_file': self.args.exp_file,
-                    "best_ap": float(self.best_ap)
+                    "start_ckpt": self.args.ckpt,
+                    "exp_file": self.args.exp_file,
+                    "best_ap": float(self.best_ap),
                 }
-                self.mlflow_logger.on_train_end(self.args, file_name=self.file_name,
-                                                metadata=metadata)
+                self.mlflow_logger.on_train_end(
+                    self.args, file_name=self.file_name, metadata=metadata
+                )
 
     def before_epoch(self):
         logger.info("---> start train epoch{}".format(self.epoch + 1))
@@ -221,7 +293,7 @@ class Trainer:
             logger.info("--->No mosaic aug now!")
             self.train_loader.close_mosaic()
             logger.info("--->Add additional L1 loss now!")
-            if self.is_distributed:
+            if self.is_distributed and hasattr(self.model, "module"):
                 self.model.module.head.use_l1 = True
             else:
                 self.model.head.use_l1 = True
@@ -247,7 +319,6 @@ class Trainer:
         """
         # log needed information
         if (self.iter + 1) % self.exp.print_interval == 0:
-            # TODO check ETA logic
             left_iters = self.max_iter * self.max_epoch - (self.progress_in_iter + 1)
             eta_seconds = self.meter["iter_time"].global_avg * left_iters
             eta_str = "ETA: {}".format(datetime.timedelta(seconds=int(eta_seconds)))
@@ -256,16 +327,19 @@ class Trainer:
                 self.epoch + 1, self.max_epoch, self.iter + 1, self.max_iter
             )
             loss_meter = self.meter.get_filtered_meter("loss")
-            loss_str = ", ".join(
-                ["{}: {:.1f}".format(k, v.latest) for k, v in loss_meter.items()]
-            )
+            loss_str = ", ".join(["{}: {:.1f}".format(k, v.latest) for k, v in loss_meter.items()])
 
             time_meter = self.meter.get_filtered_meter("time")
-            time_str = ", ".join(
-                ["{}: {:.3f}s".format(k, v.avg) for k, v in time_meter.items()]
-            )
+            time_str = ", ".join(["{}: {:.3f}s".format(k, v.avg) for k, v in time_meter.items()])
 
-            mem_str = "gpu mem: {:.0f}Mb, mem: {:.1f}Gb".format(gpu_mem_usage(), mem_usage())
+            # gpu_mem_usage() will be 0 / harmless on non-CUDA in most utils implementations,
+            # but if your util assumes CUDA, guard it:
+            if self.is_cuda:
+                mem_str = "gpu mem: {:.0f}Mb, mem: {:.1f}Gb".format(
+                    gpu_mem_usage(), mem_usage()
+                )
+            else:
+                mem_str = "mem: {:.1f}Gb".format(mem_usage())
 
             logger.info(
                 "{}, {}, {}, {}, lr: {:.3e}".format(
@@ -280,21 +354,17 @@ class Trainer:
 
             if self.rank == 0:
                 if self.args.logger == "tensorboard":
-                    self.tblogger.add_scalar(
-                        "train/lr", self.meter["lr"].latest, self.progress_in_iter)
+                    self.tblogger.add_scalar("train/lr", self.meter["lr"].latest, self.progress_in_iter)
                     for k, v in loss_meter.items():
-                        self.tblogger.add_scalar(
-                            f"train/{k}", v.latest, self.progress_in_iter)
+                        self.tblogger.add_scalar(f"train/{k}", v.latest, self.progress_in_iter)
                 if self.args.logger == "wandb":
                     metrics = {"train/" + k: v.latest for k, v in loss_meter.items()}
-                    metrics.update({
-                        "train/lr": self.meter["lr"].latest
-                    })
+                    metrics.update({"train/lr": self.meter["lr"].latest})
                     self.wandb_logger.log_metrics(metrics, step=self.progress_in_iter)
-                if self.args.logger == 'mlflow':
+                if self.args.logger == "mlflow":
                     logs = {"train/" + k: v.latest for k, v in loss_meter.items()}
                     logs.update({"train/lr": self.meter["lr"].latest})
-                    self.mlflow_logger.on_log(self.args, self.exp, self.epoch+1, logs)
+                    self.mlflow_logger.on_log(self.args, self.exp, self.epoch + 1, logs)
 
             self.meter.clear_meters()
 
@@ -317,22 +387,17 @@ class Trainer:
                 ckpt_file = self.args.ckpt
 
             ckpt = torch.load(ckpt_file, map_location=self.device)
-            # resume the model/optimizer state dict
             model.load_state_dict(ckpt["model"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
             self.best_ap = ckpt.pop("best_ap", 0)
-            # resume the training states variables
+
             start_epoch = (
                 self.args.start_epoch - 1
                 if self.args.start_epoch is not None
                 else ckpt["start_epoch"]
             )
             self.start_epoch = start_epoch
-            logger.info(
-                "loaded checkpoint '{}' (epoch {})".format(
-                    self.args.resume, self.start_epoch
-                )
-            )  # noqa
+            logger.info("loaded checkpoint '{}' (epoch {})".format(self.args.resume, self.start_epoch))
         else:
             if self.args.ckpt is not None:
                 logger.info("loading checkpoint for fine tuning")
@@ -364,11 +429,13 @@ class Trainer:
                 self.tblogger.add_scalar("val/COCOAP50", ap50, self.epoch + 1)
                 self.tblogger.add_scalar("val/COCOAP50_95", ap50_95, self.epoch + 1)
             if self.args.logger == "wandb":
-                self.wandb_logger.log_metrics({
-                    "val/COCOAP50": ap50,
-                    "val/COCOAP50_95": ap50_95,
-                    "train/epoch": self.epoch + 1,
-                })
+                self.wandb_logger.log_metrics(
+                    {
+                        "val/COCOAP50": ap50,
+                        "val/COCOAP50_95": ap50_95,
+                        "train/epoch": self.epoch + 1,
+                    }
+                )
                 self.wandb_logger.log_images(predictions)
             if self.args.logger == "mlflow":
                 logs = {
@@ -377,7 +444,7 @@ class Trainer:
                     "val/best_ap": round(self.best_ap, 3),
                     "train/epoch": self.epoch + 1,
                 }
-                self.mlflow_logger.on_log(self.args, self.exp, self.epoch+1, logs)
+                self.mlflow_logger.on_log(self.args, self.exp, self.epoch + 1, logs)
             logger.info("\n" + summary)
         synchronize()
 
@@ -387,14 +454,20 @@ class Trainer:
 
         if self.args.logger == "mlflow":
             metadata = {
-                    "epoch": self.epoch + 1,
-                    "input_size": self.input_size,
-                    'start_ckpt': self.args.ckpt,
-                    'exp_file': self.args.exp_file,
-                    "best_ap": float(self.best_ap)
-                }
-            self.mlflow_logger.save_checkpoints(self.args, self.exp, self.file_name, self.epoch,
-                                                metadata, update_best_ckpt)
+                "epoch": self.epoch + 1,
+                "input_size": self.input_size,
+                "start_ckpt": self.args.ckpt,
+                "exp_file": self.args.exp_file,
+                "best_ap": float(self.best_ap),
+            }
+            self.mlflow_logger.save_checkpoints(
+                self.args,
+                self.exp,
+                self.file_name,
+                self.epoch,
+                metadata,
+                update_best_ckpt,
+            )
 
     def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None):
         if self.rank == 0:
@@ -407,12 +480,7 @@ class Trainer:
                 "best_ap": self.best_ap,
                 "curr_ap": ap,
             }
-            save_checkpoint(
-                ckpt_state,
-                update_best_ckpt,
-                self.file_name,
-                ckpt_name,
-            )
+            save_checkpoint(ckpt_state, update_best_ckpt, self.file_name, ckpt_name)
 
             if self.args.logger == "wandb":
                 self.wandb_logger.save_checkpoint(
@@ -423,6 +491,6 @@ class Trainer:
                         "epoch": self.epoch + 1,
                         "optimizer": self.optimizer.state_dict(),
                         "best_ap": self.best_ap,
-                        "curr_ap": ap
-                    }
+                        "curr_ap": ap,
+                    },
                 )

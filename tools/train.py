@@ -2,6 +2,44 @@
 # -*- coding:utf-8 -*-
 # Copyright (c) Megvii, Inc. and its affiliates.
 
+"""
+============================= YOLOX TRAIN USAGE ==============================
+
+TRAIN (AUTO DEVICE — GPU > MPS > CPU)
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 32 --device auto
+
+TRAIN (CPU ONLY)
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 16 --device cpu
+
+TRAIN (APPLE SILICON / MPS)
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 32 --device mps
+
+TRAIN (NVIDIA CUDA GPU, FP16)
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 64 --device gpu --fp16
+
+RESUME TRAINING FROM CHECKPOINT
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 32 --device auto --resume -c YOLOX_outputs/yolox_nano_basketball/latest_ckpt.pth
+
+SPECIFY EXPERIMENT NAME
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 32 --device auto -expn my_run_name
+
+CACHE DATASET IN RAM (FASTER)
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 32 --device auto --cache ram
+
+MULTI-GPU (CUDA ONLY)
+python -m tools.train -f exps/example/custom/yolox_nano_basketball.py -b 64 --device gpu -d 2
+
+NOTES
+- device: auto | cpu | mps | gpu
+- gpu = NVIDIA CUDA only
+- mps = Apple Silicon acceleration
+- fp16 only works on CUDA
+- batch size depends heavily on VRAM / RAM
+
+===============================================================================
+"""
+
+
 import argparse
 import os
 import random

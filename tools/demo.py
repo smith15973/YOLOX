@@ -8,6 +8,9 @@
 WEBCAM (CPU)
 python -m tools.demo webcam -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --camid 0 --conf 0.3 --nms 0.3 --tsize 640 --device cpu
 
+WEBCAM (MPS)
+python -m tools.demo webcam -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --camid 0 --conf 0.3 --nms 0.3 --tsize 640 --device mps
+
 WEBCAM (NVIDIA CUDA GPU)
 python -m tools.demo webcam -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --camid 0 --conf 0.3 --nms 0.3 --tsize 640 --device gpu --fp16
 
@@ -21,7 +24,7 @@ VIDEO FILE
 python -m tools.demo video -f exps/example/custom/yolox_nano_basketball.py -c models/best_nano_ckpt.pth --path ./video.mp4 --conf 0.3 --nms 0.3 --tsize 640 --save_result
 
 NOTES
-- device: cpu | gpu
+- device: cpu | gpu | mps
 - gpu = NVIDIA CUDA
 - tsize 640 = good speed/accuracy balance
 

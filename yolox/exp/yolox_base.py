@@ -222,7 +222,8 @@ class Exp(BaseExp):
         return train_loader
 
     def random_resize(self, data_loader, epoch, rank, is_distributed):
-        tensor = torch.LongTensor(2).cuda()
+        tensor = torch.LongTensor(2).to(torch.device("cuda", dist.get_rank()) if torch.cuda.is_available() else torch.device("cpu"))
+
 
         if rank == 0:
             size_factor = self.input_size[1] * 1.0 / self.input_size[0]

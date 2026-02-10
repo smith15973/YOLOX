@@ -20,7 +20,7 @@ class Exp(MyExp):
 
         # ---------------- training ---------------- #
         self.max_epoch = 300          # Nano often benefits from a bit more
-        self.data_num_workers = 4
+        self.data_num_workers = 0
 
         # Nano is lighter: you can usually raise batch
         self.batch_size = 32          # try 16; if fine try 20/24; if OOM drop to 12
