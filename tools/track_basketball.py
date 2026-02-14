@@ -65,6 +65,7 @@ from loguru import logger
 import cv2
 import torch
 from numpy.ma.core import filled
+from torch.fx.passes.infra.pass_manager import pass_result_wrapper
 
 from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
@@ -92,13 +93,16 @@ class Detection:
 
 
 class Basketball:
-    def __init__(self, track_id):
+    def __init__(self, track_id, frame):
         self.track_id: int = track_id
         self.detections: List[Detection] = []
         self.last_possession: Tuple[int, int] = (0, 0)
         self.x: float = 0.0
         self.y: float = 0.0
-        self.last_seen: int = 0
+        self.last_seen: int = frame
+        self.shot_attempt = False
+        self.possible_make = False
+        self.made_shot = False
 
     def add_detection(self, frame: int, x: float, y: float, vx: float = 0.0, vy: float = 0.0):
         if frame < self.last_seen:
@@ -154,6 +158,20 @@ class Basketball:
     def get_last_seen_frame(self) -> Optional[int]:
         return self.detections[-1].frame if self.detections else None
 
+
+class Human:
+    def __init__(self, id, frame):
+        self.id: int = id
+        self.x: float = 0.0
+        self.y: float = 0.0
+        self.last_seen: int = frame
+
+class Rim:
+    def __init__(self, id, frame):
+        self.id: int = id
+        self.x: float = 0.0
+        self.y: float = 0.0
+        self.last_seen: int = frame
 
 
 
@@ -355,27 +373,6 @@ class Predictor(object):
         vis_res = vis(img, bboxes, scores, cls, cls_conf, self.cls_names)
         return vis_res
 
-
-def image_demo(predictor, vis_folder, path, current_time, save_result):
-    if os.path.isdir(path):
-        files = get_image_list(path)
-    else:
-        files = [path]
-    files.sort()
-    for image_name in files:
-        outputs, img_info = predictor.inference(image_name)
-        result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
-        if save_result:
-            save_folder = os.path.join(vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time))
-            os.makedirs(save_folder, exist_ok=True)
-            save_file_name = os.path.join(save_folder, os.path.basename(image_name))
-            logger.info("Saving detection result in {}".format(save_file_name))
-            cv2.imwrite(save_file_name, result_image)
-        ch = cv2.waitKey(0)
-        if ch == 27 or ch in (ord("q"), ord("Q")):
-            break
-
-
 def imageflow_track_demo(predictor, vis_folder, current_time, args):
     cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -412,6 +409,10 @@ def imageflow_track_demo(predictor, vis_folder, current_time, args):
     frame_num = 0
     classes = {'ball': 0, 'human': 1, 'rim': 2}
     basketballs: Dict[int, Basketball] = {}
+    humans: Dict[int, Rim] = {}
+    rims: Dict[int, Human] = {}
+    makes:int = 0
+    misses:int = 0
     while True:
         ret_val, frame = cap.read()
         if not ret_val:
@@ -464,17 +465,35 @@ def imageflow_track_demo(predictor, vis_folder, current_time, args):
 
 
 
+
         # draw tracks
-        for t in ball_targets + human_targets + rim_targets:
+        for t in human_targets:
             x, y, w, h = t.tlwh
             x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
             cx, cy = int(x + (w / 2)), int(y + (h / 2))
             tid = t.track_id
 
-            cv2.rectangle(result_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(result_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
             cv2.putText(
                 result_frame, f"ID {tid}", (x1, max(0, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2
+            )
+        rim = rim_targets[0] if rim_targets else None
+        rimx_margin_scale = 0.3
+        rimy_margin_scale = 0.5
+        if rim is not None:
+            x, y, w, h = rim.tlwh
+            x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+            cx, cy = int(x + (w / 2)), int(y + (h / 2))
+            tid = rim.track_id
+            rimx_margin = int(w * rimx_margin_scale)
+            rimy_margin = int(h * rimy_margin_scale)
+
+            cv2.rectangle(result_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.rectangle(result_frame, (x1 - rimx_margin, y1 - rimy_margin), (x2 + rimx_margin, y2 + rimy_margin), (0, 255, 255), 2)
+            cv2.putText(
+                result_frame, f"ID {tid}", (x1, max(0, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
             )
 
 
@@ -483,7 +502,7 @@ def imageflow_track_demo(predictor, vis_folder, current_time, args):
             x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
             cx, cy = float(x + (w / 2.0)), float(y + (h / 2.0))
             if t.track_id not in basketballs:
-                basketballs[t.track_id] = Basketball(t.track_id)
+                basketballs[t.track_id] = Basketball(t.track_id, frame_num)
 
             bball = basketballs[t.track_id]
 
@@ -494,13 +513,69 @@ def imageflow_track_demo(predictor, vis_folder, current_time, args):
 
             basketballs[t.track_id].add_detection(frame_num, cx, cy, vx, vy)  # mean = [x, y, a, h, vx, vy, va, vh]
 
-            print(f"Raw: {vx:.2f}, {vy:.2f}\n")
-            cv2.circle(result_frame, (int(cx), int(cy)), 5, (0, 255, 0), -1)
+
+            def ball_near_rim(cx, cy, rim):
+                x, y, w, h = rim.tlwh
+                rx1, ry1, rx2, ry2 = int(x), int(y), int(x + w), int(y + h)
+                rimx_margin = int(w * rimx_margin_scale)
+                rimy_margin = int(h * rimy_margin_scale)
+
+                if cx > rx1-rimx_margin and cy > ry1-rimy_margin and cx < rx2+rimx_margin and cy < ry2+rimy_margin:
+                    return True
+                return False
+
+            def within_rim(cx, rim):
+                x, y, w, h = rim.tlwh
+                rx1,  rx2,  = int(x), int(x + w)
+
+                if cx > rx1 and  cx < rx2:
+                    return True
+                return False
+
+            ball_color = (0, 0, 0)
+            if rim is not None:
+                x, y, w, h = rim.tlwh
+                rx1, ry1, rx2, ry2 = int(x), int(y), int(x + w), int(y + h)
+
+                if ball_near_rim(cx, cy, rim):
+                    basketballs[t.track_id].shot_attempt = True
+
+
+                    if cy < ry1 and within_rim(cx, rim):
+                        basketballs[t.track_id].possible_make = True
+
+                    if basketballs[t.track_id].possible_make and within_rim(cx, rim) and cy > ry2:
+                        if not basketballs[t.track_id].made_shot:
+                            basketballs[t.track_id].made_shot = True
+                            makes+=1
+
+
+                else:
+                    if basketballs[t.track_id].shot_attempt:
+                        if not basketballs[t.track_id].made_shot:
+                            misses += 1
+                        basketballs[t.track_id].shot_attempt = False
+                        basketballs[t.track_id].possible_make = False
+                        basketballs[t.track_id].made_shot = False
+
+
+            ball_color = (0, 255, 0) if basketballs[t.track_id].shot_attempt else (0, 0, 0)
+
+            cv2.circle(result_frame, (int(cx), int(cy)), 5, ball_color, -1)
             cv2.putText(
                 result_frame, f"({vx}, {vy})", (x1, max(0, y2 + 30)),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
+                cv2.FONT_HERSHEY_SIMPLEX, 1, ball_color, 2
+            )
+            cv2.rectangle(result_frame, (x1, y1), (x2, y2), ball_color, 2)
+            cv2.putText(
+                result_frame, f"ID {t.track_id}", (x1, max(0, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, ball_color, 2
             )
 
+        cv2.putText(
+            result_frame, f"{makes}/{misses+makes}", (100, 100),
+            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
+        )
 
         # for track_id, bball in basketballs.items():
         #     vx, vy = bball.get_velocity(frame_num)
