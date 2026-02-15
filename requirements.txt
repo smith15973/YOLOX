@@ -1,8 +1,12 @@
 absl-py==2.4.0
+Cython==3.2.4
+cython_bbox==0.1.5
 filelock==3.20.3
+flatbuffers==25.12.19
 fsspec==2026.2.0
 grpcio==1.78.0
 Jinja2==3.1.6
+lap==0.5.12
 loguru==0.7.3
 Markdown==3.10.1
 markdown-it-py==4.0.0
@@ -15,6 +19,7 @@ ninja==1.13.0
 numpy==2.4.2
 onnx==1.20.1
 onnx-ir==0.1.16
+onnxruntime==1.24.1
 onnxscript==0.6.1
 onnxsim==0.4.36
 opencv-python==4.13.0.92
@@ -25,6 +30,7 @@ psutil==7.2.2
 pycocotools==2.0.11
 Pygments==2.19.2
 rich==14.3.2
+scipy==1.17.0
 sympy==1.14.0
 tabulate==0.9.0
 tensorboard==2.20.0
@@ -36,4 +42,4 @@ torchvision==0.25.0
 tqdm==4.67.3
 typing_extensions==4.15.0
 Werkzeug==3.1.5
--e git+https://github.com/smith15973/YOLOX.git@560b9d456c9f0952aa002b4be23c2d232650f405#egg=yolox
+-e git+https://github.com/smith15973/YOLOX.git@2063e53271aa5c857d98af83d4b39254baf8d20e#egg=yolox
